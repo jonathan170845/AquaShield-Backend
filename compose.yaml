@@ -1,0 +1,30 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: aquashield
+      MYSQL_USER: aquashield
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: mysql+pymysql://aquashield:${MYSQL_PASSWORD}@mysql:3306/aquashield
+      FIREBASE_CREDENTIALS_PATH: /app/secrets/service-account.json
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./secrets:/app/secrets:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+volumes:
+  mysql_data:
