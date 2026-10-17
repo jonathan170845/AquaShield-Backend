@@ -8,3 +8,7 @@ secrets/
 *service-account*.json
 *firebase-adminsdk*.json
 *.db
+
+# Claude Code
+.claude/
+CLAUDE.md

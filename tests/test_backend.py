@@ -197,3 +197,65 @@ def test_real_application_startup_shutdown(tmp_path):
         assert client.post('/devices', headers={'Authorization':'Bearer ' + cfg.dev_api_token},
             json={'deviceId':'test', 'region':'jakarta', 'name':'Test', 'ownerUid':'local-admin',
                   'latitude':-6.2, 'longitude':106.8}).status_code == 201
+
+
+def published(svc):
+    topic, payload = svc.mqtt.publish.call_args.args
+    return topic, json.loads(json.dumps(payload))
+
+
+def test_command_wire_format_matches_firmware(system):
+    svc, client, _ = system
+    client.post('/devices/gate-001/commands', json={'command': 'SET_PUMP', 'value': True})
+    topic, payload = published(svc)
+    assert topic == 'iot/jakarta-barat/gate-001/cmd'
+    assert set(payload) == {'commandId', 'command', 'value'} and payload['value'] is True
+    client.post('/devices/gate-001/commands', json={'command': 'SET_PUMP', 'value': False})
+    assert published(svc)[1]['value'] is False
+    client.post('/devices/gate-001/commands', json={'command': 'RESET_SAFE'})
+    assert 'value' not in published(svc)[1]
+    client.post('/devices/gate-001/commands', json={'command': 'SET_DOOR_ANGLE', 'value': 0})
+    assert published(svc)[1]['value'] == 0
+
+
+def test_update_settings_never_sends_nulls_and_fits_firmware_buffer(system):
+    svc, client, _ = system
+    assert client.put('/devices/gate-001/settings', json={'warningCm': 15, 'dangerCm': None}).status_code == 422
+    assert client.put('/devices/gate-001/settings', json={'warningCm': 15}).status_code == 202
+    _, payload = published(svc)
+    assert payload['value'] == {'warningCm': 15} and None not in payload['value'].values()
+    full = {'commandId': 'x' * 36, 'command': 'UPDATE_SETTINGS',
+            'value': {'warningCm': 10.5, 'dangerCm': 25.5, 'criticalCm': 40.5, 'telemetryIntervalSec': 3600}}
+    assert len(json.dumps(full, separators=(',', ':'))) < 200
+
+
+def test_timed_out_settings_command_does_not_lock_settings(system):
+    svc, client, _ = system
+    first = client.put('/devices/gate-001/settings', json={'warningCm': 12}).json()
+    with svc.sessions() as db:
+        db.get(Command, first['commandId']).created_ms = now_ms() - 20000
+        db.commit()
+    svc.maintain()
+    second = client.put('/devices/gate-001/settings', json={'warningCm': 14})
+    assert second.status_code == 202
+    ingest(svc, 'ack', {'commandId': second.json()['commandId'], 'status': 'SUCCESS', 'timestamp': 1})
+    ingest(svc, 'ack', {'commandId': first['commandId'], 'status': 'SUCCESS', 'timestamp': 1})
+    assert client.get('/devices/gate-001').json()['settings']['warningCm'] == 14
+
+
+def test_firmware_telemetry_before_ntp_sync_and_lwt(system):
+    svc, client, _ = system
+    received = now_ms()
+    ingest(svc, 'telemetry', telemetry(timestamp=48213), received=received)
+    latest = client.get('/devices/gate-001').json()['latest']
+    assert latest['timestamp'] == received and latest['timestampSource'] == 'server'
+    assert latest['rainfallMmHr'] == 2.5 and latest['infraredStatus'] is None
+    svc.ingest('iot/jakarta-barat/gate-001/status', '{"deviceId":"gate-001","isOnline":false}', True)
+    assert client.get('/devices/gate-001').json()['isOnline'] is False
+
+
+def test_unregistered_or_wrong_region_is_ignored(system):
+    svc, client, _ = system
+    svc.ingest('iot/jakarta-timur/gate-001/telemetry', json.dumps({'deviceId': 'gate-001', **telemetry()}))
+    svc.ingest('iot/jakarta-barat/gate-999/telemetry', json.dumps({'deviceId': 'gate-999', **telemetry()}))
+    assert client.get('/devices/gate-001/telemetry').json() == []

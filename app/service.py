@@ -17,6 +17,7 @@ class Service:
     def __init__(self, sessions, settings, mqtt, weather, firebase):
         self.sessions, self.settings = sessions, settings
         self.mqtt, self.weather, self.firebase = mqtt, weather, firebase
+        self.unmatched = set()
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -28,8 +29,10 @@ class Service:
                 raise HTTPException(404, 'Device not found')
             value = request.model_dump(exclude_none=True).get('value')
             if request.command == 'UPDATE_SETTINGS':
+                # Only a live PENDING command blocks. A TIMEOUT one (device offline, or it dropped
+                # an unparsable command and never ACKed) must not lock settings forever.
                 for c in db.scalars(select(Command).where(Command.device_id == d.id,
-                        Command.status.in_(['PENDING', 'TIMEOUT']))):
+                        Command.status == 'PENDING')):
                     if c.payload['command'] == 'UPDATE_SETTINGS':
                         raise HTTPException(409, 'Previous settings command is unresolved')
                 merged = {**d.settings, **value}
@@ -68,6 +71,10 @@ class Service:
         with self.sessions() as db:
             d = db.get(Device, device_id)
             if d is None or d.region != region:
+                # Typically an unregistered device or a region typo; log once per topic, not per message.
+                if topic not in self.unmatched:
+                    self.unmatched.add(topic)
+                    log.warning('MQTT %s ignored: device %s not registered in region %s', channel, device_id, region)
                 return
             location = (d.latitude, d.longitude)
         weather = self.weather.rainfall(*location) if channel == 'telemetry' else None
@@ -102,7 +109,12 @@ class Service:
                 c.status, c.message, c.completed_ms = data.status, data.message, timestamp
                 c.mirror_dirty = True
                 if c.status == 'SUCCESS' and c.payload['command'] == 'UPDATE_SETTINGS':
-                    d.settings = {**d.settings, **c.payload['value']}
+                    # A late ACK of an older command must not regress newer confirmed settings.
+                    newer = db.scalars(select(Command).where(
+                        Command.device_id == d.id, Command.status == 'SUCCESS',
+                        Command.created_ms > c.created_ms, Command.id != c.id)).all()
+                    if not any(n.payload['command'] == 'UPDATE_SETTINGS' for n in newer):
+                        d.settings = {**d.settings, **c.payload['value']}
             d.mirror_dirty = True
             db.commit()
 
